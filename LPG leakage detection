@@ -1,0 +1,171 @@
+/*
+  LPG Leak Detector - Arduino Uno (no buzzer)
+  Parts: MQ-135, IRF540N (fan switch), CPU fan, servo on regulator knob
+
+  Wiring:
+    MQ-135 AO      -> A0   (VCC 5V, GND)
+    IRF540N Gate   -> D6 via 220 ohm, 10k pull-down from Gate to GND
+    IRF540N Source -> GND (common with Arduino GND and fan supply GND)
+    Fan (+)        -> 12V supply, Fan (-) -> IRF540N Drain
+    Flyback diode  -> across fan, stripe (cathode) to +12V
+    Servo signal   -> D9   (power from 5V, ideally separate supply, common GND)
+    Reset button   -> D2 to GND (uses internal pull-up)
+
+  Status LED: the Arduino's onboard LED (D13)
+    - one long blink  : ready
+    - fast blinking   : leak alarm active
+    - three short blinks : reset refused (gas still present)
+*/
+
+#include <Servo.h>
+
+// ---------- Pins ----------
+const int GAS_PIN   = A0;
+const int FAN_PIN   = 6;
+const int SERVO_PIN = 9;
+const int RESET_PIN = 2;
+const int LED_PIN   = LED_BUILTIN;  // D13
+
+// ---------- Servo angles (set these after mounting on the regulator) ----------
+const int OPEN_ANGLE   = 0;    // gas flowing
+const int CLOSED_ANGLE = 90;   // gas shut off
+const bool REOPEN_ON_RESET = true;  // set false to open the valve by hand instead
+
+// ---------- Detection tuning ----------
+const unsigned long WARMUP_MS    = 60000UL;  // sensor warm-up (use 180000 for best results)
+const int  TRIGGER_DELTA         = 120;      // rise above clean-air baseline that means a leak
+const int  CLEAR_DELTA           = 60;       // must fall below baseline + this to count as clear
+const int  HITS_REQUIRED         = 3;        // consecutive high readings before alarm
+const unsigned long FAN_RUNON_MS = 10000UL;  // keep fan running after air clears
+const unsigned long SAMPLE_MS    = 500UL;
+
+Servo valveServo;
+
+enum State { NORMAL, ALARM };
+State state = NORMAL;
+
+int baseline = 0;
+int hits = 0;
+unsigned long lastSample = 0;
+unsigned long clearSince = 0;
+bool fanOn = false;
+
+// Average several ADC readings to reduce noise
+int readGas() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += analogRead(GAS_PIN);
+    delay(5);
+  }
+  return sum / 10;
+}
+
+void setFan(bool on) {
+  fanOn = on;
+  digitalWrite(FAN_PIN, on ? HIGH : LOW);
+}
+
+void moveValve(int angle) {
+  valveServo.attach(SERVO_PIN);
+  valveServo.write(angle);
+  delay(1200);            // give the servo time to travel
+  valveServo.detach();    // stop jitter and reduce current draw
+}
+
+void blinkLed(int times, int ms) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(ms);
+    digitalWrite(LED_PIN, LOW);
+    delay(ms);
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(FAN_PIN, LOW);
+
+  Serial.println(F("Warming up gas sensor... keep it in CLEAN AIR."));
+  unsigned long start = millis();
+  while (millis() - start < WARMUP_MS) {
+    Serial.print(F("Warm-up reading: "));
+    Serial.println(readGas());
+    delay(1000);
+  }
+
+  // Take clean-air baseline
+  long sum = 0;
+  for (int i = 0; i < 20; i++) {
+    sum += readGas();
+    delay(100);
+  }
+  baseline = sum / 20;
+
+  Serial.print(F("Baseline: "));
+  Serial.println(baseline);
+  Serial.print(F("Alarm threshold: "));
+  Serial.println(baseline + TRIGGER_DELTA);
+
+  moveValve(OPEN_ANGLE);   // start with the valve open
+  blinkLed(1, 600);        // ready signal
+  Serial.println(F("Monitoring."));
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Fast LED blinking while in alarm (no delay, so sampling is unaffected)
+  if (state == ALARM) {
+    digitalWrite(LED_PIN, (now / 150) % 2);
+  }
+
+  if (now - lastSample < SAMPLE_MS) return;
+  lastSample = now;
+
+  int gas = readGas();
+  Serial.print(F("Gas: "));
+  Serial.print(gas);
+  Serial.print(F("  State: "));
+  Serial.println(state == NORMAL ? F("NORMAL") : F("ALARM"));
+
+  if (state == NORMAL) {
+    if (gas > baseline + TRIGGER_DELTA) hits++;
+    else hits = 0;
+
+    if (hits >= HITS_REQUIRED) {
+      state = ALARM;
+      Serial.println(F("!!! LEAK DETECTED - shutting valve !!!"));
+      setFan(true);
+      moveValve(CLOSED_ANGLE);
+      clearSince = 0;
+    }
+  } else {  // ALARM (latched until manual reset)
+    // Fan runs while gas is high, plus a run-on period after it clears
+    if (gas < baseline + CLEAR_DELTA) {
+      if (clearSince == 0) clearSince = now;
+      if (fanOn && now - clearSince > FAN_RUNON_MS) setFan(false);
+    } else {
+      clearSince = 0;
+      setFan(true);
+    }
+
+    // Manual reset: only accepted when the air is clear
+    if (digitalRead(RESET_PIN) == LOW) {
+      if (gas < baseline + CLEAR_DELTA) {
+        Serial.println(F("Reset accepted."));
+        setFan(false);
+        digitalWrite(LED_PIN, LOW);
+        if (REOPEN_ON_RESET) moveValve(OPEN_ANGLE);
+        hits = 0;
+        state = NORMAL;
+      } else {
+        Serial.println(F("Reset refused: gas still present."));
+        blinkLed(3, 100);
+      }
+    }
+  }
+}
